@@ -1,17 +1,11 @@
 # KC GPT 自动充值系统
 
-> **KC ChatGPT PLUS 訂閱開通平台**  
-> 使用者貼上 Session 與兌換 CDK 後，可使用本地 Stripe 自動化流程，或啟用第三方代充 API 建立並輪詢代充訂單。  
-> 配套管理後台：卡池管理、CDK 管理、任務監控、帳單稽核、第三方代充積分與套餐狀態、並發控制。
+> **KC ChatGPT PLUS 订阅开通平台**  
+> 用户粘贴 Session 与兑换 CDK 后，可使用本地 Stripe 自动化流程，或启用第三方代充 API 创建并轮询代充订单。  
+> 配套管理后台：卡池管理、CDK 管理、任务监控、账单稽核、第三方代充积分与套餐状态、并发控制。
 
-| 开发者 | TG | 
-|--------|-----|
-| **KC** | KcCatk |
 
 [License: MIT](LICENSE) · Node.js 20+ · MySQL 8 · Playwright · Docker · [GitHub](https://github.com/KC-CatK/KC-PAY-GPT)
-
-> ## 加入 Telegram 社群
-> **[點此加入 AI科研組 Telegram 群組](https://t.me/+xPBORDjtky9mM2Mx)**
 
 ---
 
@@ -21,10 +15,10 @@
 
 - **用户前台**（`/public/index.html`）：卡密兑换、Session 提交、订阅自动开通、状态查询
 - **管理后台**（`/admin`）：卡池 / CDK / 任务 / 账单 / 系统配置 / 运行日志
-- **本地自動化引擎**：Stripe Checkout 填表、信用卡輪換、hCaptcha 求解、反指紋瀏覽器與失敗重試
-- **第三方代充 API**：支援套餐／積分查詢、Session 預檢、代充建單、訂單輪詢，以及失敗訂單的供應商卡密前綴顯示
+- **本地自动化引擎**：Stripe Checkout 填表、信用卡轮换、hCaptcha 求解、反指纹浏览器与失败重试
+- **第三方代充 API**：支持套餐／积分查询、Session 预检、代充建单、订单轮询，以及失败订单的供应商卡密前缀显示
 
-啟用第三方代充 API 後，前台兌換會完全改走供應商代充流程，不再使用本地開通。
+启用第三方代充 API 后，前台兑换会完全改走供应商代充流程，不再使用本地开通。
 
 > ⚠️ **仅供学习与研究**。使用前请确保符合目标平台 ToS 与所在地法律法规。**开发者不对任何滥用导致的封号、扣款、法律纠纷负责。**
 
@@ -36,7 +30,7 @@
 |------|------|
 | **Node.js** | ≥ 20.x |
 | **MySQL** | ≥ 8.0 |
-| **記憶體** | ≥ 2 GB（本地瀏覽器自動化建議 4 GB+） |
+| **内存** | ≥ 2 GB（本地浏览器自动化建议 4 GB+） |
 | **磁盘** | ≥ 5 GB（含 Chromium + Python hCaptcha 依赖） |
 | **操作系统** | Linux / macOS / Windows |
 
@@ -74,8 +68,8 @@ cp .env.example .env
 ```env
 DB_PASSWORD=your_strong_mysql_password   # MySQL root 密码
 ADMIN_PASSWORD=your_admin_password         # 后台登录密码
-PROXY=http://user:pass@proxy-host:port     # 本地自動化或第三方訂單代理（選填）
-BROWSER_POOL=0                              # 預設關閉瀏覽器池
+PROXY=http://user:pass@proxy-host:port     # 本地自动化或第三方订单代理（选填）
+BROWSER_POOL=0                              # 默认关闭浏览器池
 ```
 
 #### 3. 一键启动
@@ -116,22 +110,22 @@ docker compose exec app bash
 
 ## 第三方代充 API
 
-在後台「系統配置 → 第三方代充 API」填寫 API Key 後啟用。預設 Base URL 為：
+在后台「系统配置 → 第三方代充 API」填写 API Key 后启用。默认 Base URL 为：
 
 ```text
 https://kc.vpss.eu.cc/
 ```
 
-啟用後，系統會：
+启用后，系统会：
 
-1. 使用供應商 `/plans` 取得 GPT 與積分套餐資訊。
-2. 以 `/balance` 顯示可用積分與 USD 餘額。
-3. 以 `/pay/inspect` 檢查 Session 格式與 JWT 有效期，再以 `/pay` 建立代充訂單。
-4. 輪詢供應商訂單結果；後台僅顯示失敗代充訂單及上游公開的 `topup_code` 前綴，不會保存或展示完整卡密。
+1. 使用供应商 `/plans` 获取 GPT 与积分套餐信息。
+2. 以 `/balance` 显示可用积分与 USD 余额。
+3. 以 `/pay/inspect` 检查 Session 格式与 JWT 有效期，再以 `/pay` 创建代充订单。
+4. 轮询供应商订单结果；后台仅显示失败代充订单及上游公开的 `topup_code` 前缀，不会保存或展示完整卡密。
 
-API Key 至少需要 `plans:read`、`balance:read`、`pay:write` Scope；如需使用任務查詢，另需 `tasks:read`。完整供應商協議見 [對接 API 文件](对接api.md)。
+API Key 至少需要 `plans:read`、`balance:read`、`pay:write` Scope；如需使用任务查询，另需 `tasks:read`。完整供应商协议见 [对接 API 文件](对接api.md)。
 
-> 瀏覽器池預設關閉（`BROWSER_POOL=0`）。第三方代充模式不使用本地瀏覽器開通流程。
+> 浏览器池默认关闭（`BROWSER_POOL=0`）。第三方代充模式不使用本地浏览器开通流程。
 
 ---
 
@@ -318,7 +312,7 @@ sudo certbot --nginx -d your-domain.com
 | **信用卡卡池** | 批量导入、智能选卡、冷却机制、Stripe 拒卡自动报废、失败换卡重试 |
 | **支付地区** | PH / US / SG / MY 可切换，配套免税地址池 |
 | **账单审计** | 自动记录每笔支付，支持筛选与 CSV 导出 |
-| **瀏覽器池** | 本地自動化的可選多槽位模式；目前預設關閉（`BROWSER_POOL=0`） |
+| **浏览器池** | 本地自动化的可选多槽位模式；目前默认关闭（`BROWSER_POOL=0`） |
 | **hCaptcha** | VLM / 打码平台 / Python solver 多通道 |
 | **反指纹** | Stealth + 30+ 指纹点修正，支持真 Chrome / Edge |
 | **Telegram 通知** | 任务成功 / 失败推送（后台配置） |
@@ -379,14 +373,14 @@ sudo certbot --nginx -d your-domain.com
 ├── Dockerfile
 ├── mysql-schema.sql
 ├── .env.example
-└── 对接api.md             # 第三方代充 API 對接文件
+└── 对接api.md             # 第三方代充 API 对接文件
 ```
 
 ---
 
 ## 接口文档
 
-本系統 REST API 請依 `server.js` 路由使用；第三方代充接口見 [對接 API 文件](对接api.md)。常用接口：
+本系统 REST API 请依 `server.js` 路由使用；第三方代充接口见 [对接 API 文件](对接api.md)。常用接口：
 
 | 用途 | Method + Path | 鉴权 |
 |------|---------------|------|
@@ -431,7 +425,7 @@ A: 管理员 PowerShell 执行：`Set-ExecutionPolicy -Scope CurrentUser RemoteS
 |------|------|
 | 3000 | Web 服务 + WebSocket（可通过 `PORT` 环境变量修改） |
 | 3306 | MySQL（Docker 模式下映射到宿主机） |
-| 19222+ | 瀏覽器池 CDP 連接埠（僅啟用 `BROWSER_POOL=1` 時使用） |
+| 19222+ | 浏览器池 CDP 端口（仅启用 `BROWSER_POOL=1` 时使用） |
 
 ---
 
