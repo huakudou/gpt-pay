@@ -1,4 +1,5 @@
 const { executePaymentWithRetry } = require('./payment-retry');
+const { cancelRenewalAfterPayment } = require('./post-payment-renewal');
 const { openPricingCheckout } = require('./pricing-checkout');
 const { openApiCheckout } = require('./chatgpt');
 const store = require('./mysql-store');
@@ -23,6 +24,7 @@ const path = require('path');
  *    - 自动选取免税地址
  *    - 记录账单信息
  * 6. 检测支付结果：成功则继续，失败则标记 payment_failed
+ * 7. 支付成功后取消自动续费并读回确认；失败时保留支付成功结果并提示人工处理
  *
  * 进度输出约定（供 server.js / product_activator.js 解析）：
  * - "正在检查代理连通性"  → 代理检查开始
@@ -187,6 +189,7 @@ async function run() {
     let context = null;
     let page = null;
     let paymentSucceeded = false;
+    let autoRenewCancelled = false;
 
     const preparedProxy = await preparePlaywrightProxy(CONFIG.proxy);
     proxyCleanup = preparedProxy.cleanup;
@@ -587,11 +590,17 @@ async function run() {
 
         if (paymentResult.success) {
             paymentSucceeded = true;
+            console.log('AUTO_RENEW_CANCEL_STARTED');
             console.log(`    [+] 最终校验：支付成功! (stripe_card_payment)`);
             console.log("PAYMENT_SUCCESS");
             for (const screenshotPath of paymentResult.screenshots || []) {
                 console.log(`SUCCESS_SCREENSHOT: ${screenshotPath}`);
             }
+            const renewalResult = await cancelRenewalAfterPayment(
+                loginInfo.session?.accessToken || sessionData?.accessToken || CONFIG.chatgptToken,
+                { email: loginInfo.email || email, timezoneOffsetMin: -new Date().getTimezoneOffset() }
+            );
+            autoRenewCancelled = renewalResult.ok;
         } else {
             const errorMsg = paymentResult.error || '支付失败（未知原因）';
             for (const screenshotPath of paymentResult.screenshots || []) {
@@ -616,7 +625,7 @@ async function run() {
     } finally {
         console.log("👋 [系统] 流程结束，正在关闭浏览器...");
         // 先关闭 context 以 flush 录像并取回路径，再关浏览器
-        await finalizeVideo(context, page, { deleteOnSuccess: paymentSucceeded }).catch(() => { });
+        await finalizeVideo(context, page, { deleteOnSuccess: paymentSucceeded && autoRenewCancelled }).catch(() => { });
         await closeTaskBrowser(browserSession, browser);
         await proxyCleanup();
     }

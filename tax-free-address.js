@@ -259,17 +259,12 @@ async function batchGenerateUsAddresses(count = 10) {
 }
 
 /**
- * 支付结账时选取账单地址：优先 US 地址池，池空则即时随机生成
+ * 支付结账时仅选取数据库中配置的 US 账单地址
  * @param {number|null} lastUsedId
  * @returns {Promise<{ id: number, line1: string, city: string, state: string, postal_code: string, country: string, generated?: boolean }>}
  */
 async function pickBillingAddressForCheckout(lastUsedId = null) {
-    let picked;
-    try {
-        picked = await pickTaxFreeAddress('US', lastUsedId);
-    } catch (_) {
-        picked = { id: 0, ...generateRandomUsTaxFreeAddress() };
-    }
+    const picked = await pickTaxFreeAddress('US', lastUsedId);
     return {
         ...picked,
         state: normalizeUsStateName(picked.state)

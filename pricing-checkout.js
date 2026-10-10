@@ -59,6 +59,10 @@ function matchesCountryLabel(text, labels) {
 }
 
 async function isBusinessTabActive(page) {
+    const businessRadio = page.getByRole('radio', { name: /^(Business|Toggle for switching to Business plans)$/i }).first();
+    if (await businessRadio.isVisible().catch(() => false)) {
+        return await businessRadio.getAttribute('aria-checked') === 'true';
+    }
     const businessTab = page.getByRole('tab', { name: /^Business$/i }).first();
     if (await businessTab.isVisible({ timeout: 800 }).catch(() => false)) {
         const selected = await businessTab.getAttribute('aria-selected').catch(() => null);
@@ -74,6 +78,10 @@ async function isBusinessTabActive(page) {
 }
 
 async function isPersonalPlanView(page) {
+    const personalRadio = page.getByRole('radio', { name: /^(Personal|个人|Toggle for switching to Personal plans)$/i }).first();
+    if (await personalRadio.isVisible().catch(() => false)) {
+        return await personalRadio.getAttribute('aria-checked') === 'true';
+    }
     if (await isBusinessTabActive(page)) {
         return false;
     }
@@ -118,6 +126,7 @@ async function switchToPersonalPlans(page) {
     }
 
     const personalCandidates = [
+        () => page.getByRole('radio', { name: /^(Personal|个人|Toggle for switching to Personal plans)$/i }).first(),
         () => page.getByRole('tab', { name: /^Personal$/i }).first(),
         () => page.getByRole('tab', { name: /^个人$/ }).first(),
         () => page.getByRole('button', { name: /^Personal$/i }).first(),
@@ -135,7 +144,8 @@ async function switchToPersonalPlans(page) {
             if (await el.isVisible({ timeout: 1200 })) {
                 const selected = await el.getAttribute('aria-selected').catch(() => null);
                 const pressed = await el.getAttribute('aria-pressed').catch(() => null);
-                if (selected === 'true' || pressed === 'true') {
+                const checked = await el.getAttribute('aria-checked').catch(() => null);
+                if (selected === 'true' || pressed === 'true' || checked === 'true') {
                     console.log('✅ [步骤] Personal 标签已选中');
                     return;
                 }
@@ -641,6 +651,31 @@ async function clickPlanUpgrade(page, planType) {
     await switchToPersonalPlans(page);
     await page.waitForTimeout(1000);
 
+    // 优先使用当前网站的套餐专属标识，避免多个 Start now 入口之间发生误选。
+    const planKey = plan === 'plus' ? 'plus' : 'pro';
+    const planButton = page.getByTestId(`select-plan-button-${planKey}-upgrade`);
+    if (await planButton.isVisible().catch(() => false)) {
+        await planButton.click({ timeout: 10000 });
+        console.log(`✅ [步骤] 已点击 ${plan} 套餐专属升级入口`);
+        return;
+    }
+
+    // 兼容卡片内的 Start now 按钮或链接，按套餐标题限定范围。
+    const planTitle = plan === 'plus' ? /^(ChatGPT\s+)?Plus$/i : /^(ChatGPT\s+)?Pro$/i;
+    const titles = page.getByText(planTitle);
+    for (let index = 0; index < await titles.count(); index += 1) {
+        const title = titles.nth(index);
+        if (!await title.isVisible().catch(() => false)) continue;
+        const card = title.locator('xpath=ancestor::*[.//button or .//a[@href] or .//*[@role="button"]][1]');
+        const action = card.locator('button,a[href],[role="button"]').filter({ hasText: /^\s*(Start now|立即开始|开始使用)\s*$/i }).first();
+        if (await action.isVisible().catch(() => false)) {
+            await action.scrollIntoViewIfNeeded();
+            await action.click({ timeout: 10000 });
+            console.log(`✅ [步骤] 已点击 ${plan} 套餐卡片内的 Start now`);
+            return;
+        }
+    }
+
     for (const pattern of patterns) {
         try {
             const btn = page.getByRole('button', { name: pattern }).first();
@@ -727,6 +762,11 @@ async function waitForCheckoutPage(page, timeout = 90000) {
             await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
             await page.waitForTimeout(2000);
             await assertChatGptLoggedIn(page, 'Checkout');
+            const { discoverCardInputs } = require('./stripe-payment');
+            const fields = await discoverCardInputs(page, Math.max(1000, deadline - Date.now()));
+            if (!fields?.card || !fields.expiry || !fields.cvc) {
+                throw new Error('Checkout 页面已打开，但信用卡支付表单未加载完成（卡号、有效期或 CVC 缺失）');
+            }
             console.log(`✅ [步骤] Checkout 页面已打开: ${url.slice(0, 80)}...`);
             return url;
         }

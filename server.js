@@ -720,9 +720,14 @@ function analyzeProcessOutput(output, timedOut) {
     const success = normalized.includes('PAYMENT_SUCCESS') || normalized.includes('最终校验：支付成功') || normalized.includes('支付成功');
 
     if (success) {
+        const renewalUnconfirmed = normalized.includes('AUTO_RENEW_CANCEL_FAILED')
+            || (!normalized.includes('AUTO_RENEW_CANCELLED')
+                && (normalized.includes('AUTO_RENEW_CANCEL_STARTED') || timedOut));
         return {
             status: 'success',
-            message: '激活成功',
+            message: renewalUnconfirmed
+                ? '激活成功，但自动续费未确认关闭，请在续费管理中处理'
+                : normalized.includes('AUTO_RENEW_CANCELLED') ? '激活成功，自动续费已关闭' : '激活成功',
             reachedPayment: true,
             shouldRetry: false,
             deletePhone: false,
@@ -3522,7 +3527,7 @@ function spawnActivationWorker({ task, token, sessionRaw, cdk, cdkDetails, clien
                 lastProgress = currentProgress;
                 await store.updateTaskLog(task.jobKey, {
                     status: currentStatus,
-                    message: currentStatus === 'success' ? '激活成功' : '正在开通中',
+                    message: currentStatus === 'success' ? run.analysis.message : '正在开通中',
                     rawOutput: finalRun.output,
                     progress: currentProgress,
                     cdkCode: cdk,
@@ -3534,7 +3539,7 @@ function spawnActivationWorker({ task, token, sessionRaw, cdk, cdkDetails, clien
                     jobKey: task.jobKey,
                     progress: currentProgress,
                     status: currentStatus,
-                    message: currentStatus === 'success' ? '激活成功' : '正在开通中',
+                    message: currentStatus === 'success' ? run.analysis.message : '正在开通中',
                     cdkCode: cdk,
                     cardLast4
                 });

@@ -185,7 +185,8 @@ async function discoverCardInputs(page, timeout = 45000) {
         if (card) {
             const expiry = await findVisibleInput(contexts, expirySelectors, 1500);
             const cvc = await findVisibleInput(contexts, cvcSelectors, 1500);
-            return { card, expiry, cvc };
+            // 三个字段可能分批加载，必须全部可见后才能进入填卡流程。
+            if (expiry && cvc) return { card, expiry, cvc };
         }
 
         await page.waitForTimeout(500);
@@ -381,6 +382,13 @@ async function waitForCheckoutTaxRecalculation(page, options = {}) {
 }
 
 async function ensureCheckoutTaxFreeAmount(page, address, baselineAmount) {
+    // 先检查表单错误，避免把无效账单地址误报为金额重算失败。
+    if (await hasBillingValidationError(page)) {
+        return {
+            ok: false,
+            error: '账单地址校验未通过，请使用真实账单地址核对国家、州/省和邮编后重试',
+        };
+    }
     const due = await readCheckoutDueAmount(page);
     if (!baselineAmount || !due?.amount) {
         return { ok: true, due };
@@ -1085,19 +1093,21 @@ async function waitForBillingFields(page, timeout = 20000) {
     ];
     const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
-        for (const sel of attachedSelectors) {
-            try {
-                if ((await page.locator(sel).count()) > 0) {
-                    return true;
-                }
-            } catch (_) { /* continue */ }
-        }
-        for (const sel of visibleSelectors) {
-            try {
-                if (await page.locator(sel).first().isVisible({ timeout: 300 })) {
-                    return true;
-                }
-            } catch (_) { /* continue */ }
+        for (const context of await getBillingContexts(page)) {
+            for (const sel of attachedSelectors) {
+                try {
+                    if ((await context.locator(sel).count()) > 0) {
+                        return true;
+                    }
+                } catch (_) { /* continue */ }
+            }
+            for (const sel of visibleSelectors) {
+                try {
+                    if (await context.locator(sel).first().isVisible({ timeout: 300 })) {
+                        return true;
+                    }
+                } catch (_) { /* continue */ }
+            }
         }
         await page.waitForTimeout(500);
     }
@@ -1148,28 +1158,48 @@ async function resolveElementTag(el) {
     return el.evaluate((node) => node.tagName.toLowerCase()).catch(() => '');
 }
 
+async function getBillingContexts(page) {
+    if (typeof page.frames !== 'function') return [page];
+    const billingFrames = [];
+    for (const frame of page.frames()) {
+        if (frame === page.mainFrame()) continue;
+        try {
+            // 优先使用同时包含国家和地址字段的 iframe，避免选中主页面的地区设置。
+            const country = frame.locator(OPENAI_BILLING_FIELD_SELECTORS.country.join(', '));
+            const address = frame.locator([...OPENAI_BILLING_FIELD_SELECTORS.line1, ...OPENAI_BILLING_FIELD_SELECTORS.postal].join(', '));
+            const hasCountry = await country.count()
+                || await frame.getByLabel(/^country or region$|^country$|^国家或地区$|^国家$/i).count()
+                || await frame.getByRole('combobox', { name: /^country or region$|^country$|^国家或地区$|^国家$/i }).count();
+            if (hasCountry && await address.count()) billingFrames.push(frame);
+        } catch (_) { /* 忽略已卸载的 iframe */ }
+    }
+    return billingFrames.length ? billingFrames : [page];
+}
+
 async function fillFirstVisibleSelector(page, selectors, value, logLabel, waitMs = 8000) {
     if (value === undefined || value === null || String(value) === '') return false;
     const deadline = Date.now() + waitMs;
     while (Date.now() < deadline) {
-        for (const sel of selectors) {
-            try {
-                const el = page.locator(sel).first();
-                if ((await el.count()) === 0) continue;
-                const tag = await resolveElementTag(el);
-                if (tag === 'select') continue;
-                if (!(await el.isVisible({ timeout: 300 }).catch(() => false))) continue;
-                const current = String(await el.inputValue({ timeout: 500 }).catch(() => '')).trim();
-                if (current) {
-                    console.log(`  [Stripe] ⏭️ ${logLabel} 已有值，跳过`);
+        for (const context of await getBillingContexts(page)) {
+            for (const sel of selectors) {
+                try {
+                    const el = context.locator(sel).first();
+                    if ((await el.count()) === 0) continue;
+                    const tag = await resolveElementTag(el);
+                    if (tag === 'select') continue;
+                    if (!(await el.isVisible({ timeout: 300 }).catch(() => false))) continue;
+                    const current = String(await el.inputValue({ timeout: 500 }).catch(() => '')).trim();
+                    if (current.toLowerCase() === String(value).trim().toLowerCase()) {
+                        console.log(`  [Stripe] ⏭️ ${logLabel} 已与配置值一致，跳过`);
+                        return true;
+                    }
+                    await el.scrollIntoViewIfNeeded();
+                    await el.click({ timeout: 2000 });
+                    await el.fill(String(value));
+                    console.log(`  [Stripe] ✅ ${logLabel}: ${value}`);
                     return true;
-                }
-                await el.scrollIntoViewIfNeeded();
-                await el.click({ timeout: 2000 });
-                await el.fill(String(value));
-                console.log(`  [Stripe] ✅ ${logLabel}: ${value}`);
-                return true;
-            } catch (_) { /* next selector */ }
+                } catch (_) { /* next selector */ }
+            }
         }
         await page.waitForTimeout(500);
     }
@@ -1180,33 +1210,36 @@ async function selectFirstVisibleSelect(page, selectors, optionLabels, logLabel,
     const options = [...new Set(optionLabels.map(String).filter(Boolean))];
     const deadline = Date.now() + waitMs;
     while (Date.now() < deadline) {
-        for (const sel of selectors) {
-            try {
-                const el = page.locator(sel).first();
-                if ((await el.count()) === 0) continue;
-                const tag = await resolveElementTag(el);
-                if (tag !== 'select') {
-                    if (!(await el.isVisible({ timeout: 300 }).catch(() => false))) continue;
-                    const ok = await selectBillingComboboxItem(page, { el }, options, logLabel);
-                    if (ok) return true;
-                    continue;
-                }
-                // 原生 <select> 常被视觉隐藏（自定义下拉覆盖），不要求 visible，直接 selectOption
-                for (const opt of options) {
-                    try {
-                        await el.selectOption({ label: opt }, { timeout: 2000 });
-                        console.log(`  [Stripe] ✅ ${logLabel}: ${opt}`);
-                        await page.waitForTimeout(600);
-                        return true;
-                    } catch (_) { /* next */ }
-                    try {
-                        await el.selectOption({ value: opt }, { timeout: 2000 });
-                        console.log(`  [Stripe] ✅ ${logLabel}: ${opt} (value)`);
-                        await page.waitForTimeout(600);
-                        return true;
-                    } catch (_) { /* next */ }
-                }
-            } catch (_) { /* next selector */ }
+        for (const context of await getBillingContexts(page)) {
+            for (const sel of selectors) {
+                try {
+                    const el = context.locator(sel).first();
+                    if ((await el.count()) === 0) continue;
+                    const tag = await resolveElementTag(el);
+                    if (tag !== 'select') {
+                        if (!(await el.isVisible({ timeout: 300 }).catch(() => false))) continue;
+                        const ok = await selectBillingComboboxItem(context, { el }, options, logLabel);
+                        if (ok) return true;
+                        continue;
+                    }
+                    // 原生 <select> 常被视觉隐藏（自定义下拉覆盖），不要求 visible，直接 selectOption
+                    const selectOptions = { timeout: 2000, force: !(await el.isVisible()) };
+                    for (const opt of options) {
+                        try {
+                            await el.selectOption({ label: opt }, selectOptions);
+                            console.log(`  [Stripe] ✅ ${logLabel}: ${opt}`);
+                            await page.waitForTimeout(600);
+                            return true;
+                        } catch (_) { /* next */ }
+                        try {
+                            await el.selectOption({ value: opt }, selectOptions);
+                            console.log(`  [Stripe] ✅ ${logLabel}: ${opt} (value)`);
+                            await page.waitForTimeout(600);
+                            return true;
+                        } catch (_) { /* next */ }
+                    }
+                } catch (_) { /* next selector */ }
+            }
         }
         await page.waitForTimeout(500);
     }
@@ -1214,19 +1247,31 @@ async function selectFirstVisibleSelect(page, selectors, optionLabels, logLabel,
 }
 
 async function getCurrentBillingCountryValue(page) {
-    for (const sel of OPENAI_BILLING_FIELD_SELECTORS.country) {
-        try {
-            const el = page.locator(sel).first();
-            if (!(await el.isVisible({ timeout: 800 }))) continue;
-            const tag = await resolveElementTag(el);
-            if (tag !== 'select') continue;
-            const value = await el.inputValue().catch(() => '');
-            const label = await el.evaluate((node) => {
-                const opt = node.options[node.selectedIndex];
-                return opt ? opt.textContent.trim() : '';
-            }).catch(() => '');
-            return { value, label };
-        } catch (_) { /* next */ }
+    for (const context of await getBillingContexts(page)) {
+        for (const sel of OPENAI_BILLING_FIELD_SELECTORS.country) {
+            try {
+                const el = context.locator(sel).first();
+                if ((await el.count()) === 0) continue;
+                const tag = await resolveElementTag(el);
+                if (tag !== 'select') continue;
+                const value = await el.inputValue().catch(() => '');
+                const label = await el.evaluate((node) => {
+                    const opt = node.options[node.selectedIndex];
+                    return opt ? opt.textContent.trim() : '';
+                }).catch(() => '');
+                return { value, label };
+            } catch (_) { /* next */ }
+        }
+        // 自定义下拉可能没有可定位的原生选择框，按账单字段标签读取显示值。
+        for (const pattern of [/^country or region$/i, /^country$/i, /^国家或地区$/, /^国家$/]) {
+            try {
+                const el = context.getByLabel(pattern).first();
+                if (!(await el.isVisible({ timeout: 300 }))) continue;
+                const value = await el.inputValue({ timeout: 500 }).catch(() => '');
+                const label = await el.textContent({ timeout: 500 }).catch(() => '');
+                if (value || label) return { value, label: String(label || '').trim() };
+            } catch (_) { /* 继续查找下一个标签 */ }
+        }
     }
     return { value: '', label: '' };
 }
@@ -1446,6 +1491,9 @@ async function selectBillingComboboxItem(page, item, optionLabels, logLabel) {
     if (!item?.el) return false;
     const options = optionLabels.filter(Boolean);
     try {
+        // 下拉选项与控件必须在同一文档查找，支持嵌入 iframe 的账单表单。
+        const handle = await item.el.elementHandle();
+        const optionContext = await handle?.ownerFrame() || page;
         await item.el.scrollIntoViewIfNeeded();
         let tag = String(item.meta?.tag || '').toLowerCase();
         if (!tag || tag === 'unknown') {
@@ -1471,8 +1519,8 @@ async function selectBillingComboboxItem(page, item, optionLabels, logLabel) {
 
         if (tag === 'input' || tag === 'textarea') {
             await item.el.fill(String(options[0] || ''));
-            await page.keyboard.press('ArrowDown').catch(() => { });
-            await page.keyboard.press('Enter').catch(() => { });
+            await item.el.press('ArrowDown').catch(() => { });
+            await item.el.press('Enter').catch(() => { });
             console.log(`  [Stripe] ✅ ${logLabel}: ${options[0]} (typeahead)`);
             return true;
         }
@@ -1481,7 +1529,7 @@ async function selectBillingComboboxItem(page, item, optionLabels, logLabel) {
         await page.waitForTimeout(350);
         for (const opt of options) {
             try {
-                const option = page.getByRole('option', { name: opt }).first();
+                const option = optionContext.getByRole('option', { name: opt }).first();
                 if (await option.isVisible({ timeout: 1200 })) {
                     await option.click({ timeout: 2000 });
                     console.log(`  [Stripe] ✅ ${logLabel}: ${opt}`);
@@ -1489,7 +1537,7 @@ async function selectBillingComboboxItem(page, item, optionLabels, logLabel) {
                 }
             } catch (_) { /* next */ }
             try {
-                await page.getByText(opt, { exact: true }).click({ timeout: 1200 });
+                await optionContext.getByText(opt, { exact: true }).click({ timeout: 1200 });
                 console.log(`  [Stripe] ✅ ${logLabel}: ${opt}`);
                 return true;
             } catch (_) { /* next */ }
@@ -1516,14 +1564,10 @@ async function fillOpenAiBillingDirect(page, address, fullName, baselineAmount =
         filled.country = true;
         console.log('  [Stripe] ✅ 国家已是 United States');
     } else {
-        filled.country = await selectFirstVisibleSelect(
-            page,
-            OPENAI_BILLING_FIELD_SELECTORS.country,
-            ['United States', '美国', 'US', countryCode],
-            '国家',
-            directWait
-        );
+        filled.country = await selectBillingCountry(page, ['United States', '美国', countryCode]);
     }
+    // 国家未生效时停止写入州和邮编，避免产生混合国家的地址。
+    if (!filled.country) return filled;
 
     if (filled.country) {
         await page.waitForTimeout(1500);
@@ -1531,8 +1575,11 @@ async function fillOpenAiBillingDirect(page, address, fullName, baselineAmount =
         await waitForCheckoutTaxRecalculation(page, { baselineAmount });
         const line1Deadline = Date.now() + 10000;
         while (Date.now() < line1Deadline) {
-            const line1Input = await locateBillingLine1Input(page).catch(() => null);
-            if (line1Input) break;
+            let found = false;
+            for (const context of await getBillingContexts(page)) {
+                if (await locateBillingLine1Input(context).catch(() => null)) { found = true; break; }
+            }
+            if (found) break;
             await page.waitForTimeout(400);
         }
     }
@@ -1655,6 +1702,14 @@ async function fillOpenAiBillingBySectionMeta(page, address, fullName) {
 }
 
 async function findBillingControl(page, labelPatterns, role = 'textbox') {
+    for (const context of await getBillingContexts(page)) {
+        const field = await findBillingControlInContext(context, labelPatterns, role);
+        if (field) return field;
+    }
+    return null;
+}
+
+async function findBillingControlInContext(page, labelPatterns, role = 'textbox') {
     const patterns = Array.isArray(labelPatterns) ? labelPatterns : [labelPatterns];
 
     for (const pat of patterns) {
@@ -1704,17 +1759,6 @@ async function findBillingControl(page, labelPatterns, role = 'textbox') {
         } catch (_) { /* next */ }
     }
 
-    for (const frame of page.frames()) {
-        if (frame === page.mainFrame()) continue;
-        for (const pat of patterns) {
-            try {
-                const el = frame.getByLabel(pat, { exact: false }).first();
-                if (await el.isVisible({ timeout: 500 }).catch(() => false)) {
-                    return el;
-                }
-            } catch (_) { /* next */ }
-        }
-    }
     return null;
 }
 
@@ -1741,8 +1785,8 @@ async function fillBillingControl(page, labelPatterns, value, logLabel) {
         }
 
         const current = String(await field.inputValue({ timeout: 1000 }).catch(() => '')).trim();
-        if (current) {
-            console.log(`  [Stripe] ⏭️ ${logLabel} 已有值 (${current.slice(0, 24)}...)，跳过`);
+        if (current.toLowerCase() === String(value).trim().toLowerCase()) {
+            console.log(`  [Stripe] ⏭️ ${logLabel} 已与配置值一致，跳过`);
             return true;
         }
 
@@ -1780,7 +1824,10 @@ async function selectBillingCountry(page, optionLabels) {
         optionLabels,
         '国家'
     );
-    if (ok) return true;
+    if (ok) {
+        const current = await getCurrentBillingCountryValue(page);
+        if (getBillingFieldStatus({ country: current.value || current.label }).country) return true;
+    }
 
     const patterns = [/country or region/i, /国家或地区/i, /^country$/i, /国家/];
     let field = null;
@@ -1796,7 +1843,9 @@ async function selectBillingCountry(page, optionLabels) {
         return false;
     }
 
-    return selectBillingComboboxItem(page, { el: field }, optionLabels, '国家');
+    if (!(await selectBillingComboboxItem(page, { el: field }, optionLabels, '国家'))) return false;
+    const current = await getCurrentBillingCountryValue(page);
+    return getBillingFieldStatus({ country: current.value || current.label }).country;
 }
 
 async function selectBillingState(page, stateFullName, stateRaw) {
@@ -1896,17 +1945,23 @@ async function hasBillingValidationError(page) {
         /your billing address is required/i,
         /please provide your full name/i,
         /this field is incomplete/i,
+        /your postal code is invalid/i,
+        /your zip code is invalid/i,
+        /邮政编码.*无效/i,
+        /邮编.*无效/i,
         /请提供.*全名/i,
         /此字段不完整/i,
         /您的账单地址/i
     ];
-    for (const re of patterns) {
-        try {
-            const el = page.getByText(re).first();
-            if (await el.isVisible({ timeout: 300 })) {
-                return true;
-            }
-        } catch (_) { /* next */ }
+    for (const context of await getBillingContexts(page)) {
+        for (const re of patterns) {
+            try {
+                const el = context.getByText(re).first();
+                if (await el.isVisible({ timeout: 300 })) {
+                    return true;
+                }
+            } catch (_) { /* next */ }
+        }
     }
     return false;
 }
@@ -1932,7 +1987,7 @@ async function fillOpenAiCheckoutBilling(page, address, fullName) {
         );
     }
 
-    if (await isOpenAiBillingFormComplete(page)) {
+    if (await isOpenAiBillingFormComplete(page, {}, address)) {
         console.log('  [Stripe] ✅ 账单表单已完整，跳过重复填写');
         const taxCheck = await ensureCheckoutTaxFreeAmount(page, address, baselineAmount);
         if (!taxCheck.ok) {
@@ -1958,7 +2013,7 @@ async function fillOpenAiCheckoutBilling(page, address, fullName) {
     filled = await syncFilledFlags(page, filled);
     await dismissAddressAutocomplete(page);
 
-    if (await isOpenAiBillingFormComplete(page, filled)) {
+    if (await isOpenAiBillingFormComplete(page, filled, address)) {
         console.log('  [Stripe] ✅ 账单地址校验通过（直连填写）');
         const taxCheck = await ensureCheckoutTaxFreeAmount(page, address, baselineAmount);
         if (!taxCheck.ok) {
@@ -1971,7 +2026,7 @@ async function fillOpenAiCheckoutBilling(page, address, fullName) {
         };
     }
 
-    let status = getBillingFieldStatus(await readBillingInputValues(page), filled);
+    let status = getBillingFieldStatus(await readBillingInputValues(page), filled, address);
     let missing = listBillingMissing(status);
 
     if (missing.length > 0) {
@@ -1983,6 +2038,7 @@ async function fillOpenAiCheckoutBilling(page, address, fullName) {
         if (!status.country) {
             filled.country = await selectBillingCountry(page, ['United States', '美国', 'US']);
             if (filled.country) await page.waitForTimeout(800);
+            else return { ok: false, error: '账单国家未能切换为配置地址的国家，请核对账单国家后重试', filled };
         }
         if (!status.line1) {
             filled.line1 = await fillBillingLine1Strict(page, address.line1);
@@ -2011,19 +2067,16 @@ async function fillOpenAiCheckoutBilling(page, address, fullName) {
         await dismissAddressAutocomplete(page);
     }
 
-    status = getBillingFieldStatus(await readBillingInputValues(page), filled);
+    status = getBillingFieldStatus(await readBillingInputValues(page), filled, address);
     missing = listBillingMissing(status);
 
     if (missing.length > 0) {
         console.warn(`  [Stripe] ⚠️ 账单字段未全部填写: ${missing.join(', ')}`);
-        const stillError = await hasBillingValidationError(page);
-        if (stillError || missing.includes('line1')) {
-            return {
-                ok: false,
-                error: `账单地址未完整填写 (缺失: ${missing.join(', ') || '校验未通过'})`,
-                filled
-            };
-        }
+        return {
+            ok: false,
+            error: `账单地址与数据库配置不一致或未完整填写 (字段: ${missing.join(', ')})`,
+            filled
+        };
     }
 
     console.log('  [Stripe] ✅ 账单地址校验通过');
@@ -2054,14 +2107,18 @@ async function readControlValue(item) {
             return opt ? opt.textContent.trim() : (node.value || '');
         }).catch(() => '')).trim();
     }
+    if (tag === 'button' || tag === 'div') {
+        return String(await item.el.textContent({ timeout: 800 }).catch(() => '')).trim();
+    }
     return String(await item.el.inputValue({ timeout: 800 }).catch(() => '')).trim();
 }
 
 async function readBillingInputValues(page) {
     const result = { name: '', line1: '', city: '', postal: '', state: '', country: '' };
+    const contexts = await getBillingContexts(page);
 
     try {
-        const items = await getBillingInputsBelowHeading(page);
+        const items = contexts.includes(page) ? await getBillingInputsBelowHeading(page) : [];
         for (const item of items) {
             const val = await readControlValue(item);
             if (!val) continue;
@@ -2091,69 +2148,73 @@ async function readBillingInputValues(page) {
         ['country', [/country or region/i, /^country$/i], [/country/i]]
     ];
 
-    for (const [key, labelPatterns, placeholderPatterns] of readers) {
-        if (result[key]) continue;
-        for (const pat of labelPatterns) {
-            try {
-                const el = page.getByLabel(pat).first();
-                if (!(await el.isVisible({ timeout: 250 }).catch(() => false))) continue;
-                const val = String(await el.inputValue({ timeout: 800 }).catch(() => '')).trim();
-                if (val) {
-                    result[key] = val;
-                    break;
-                }
-            } catch (_) { /* next */ }
+    for (const context of contexts) {
+        for (const [key, labelPatterns, placeholderPatterns] of readers) {
+            if (result[key]) continue;
+            for (const pat of labelPatterns) {
+                try {
+                    const el = context.getByLabel(pat).first();
+                    if (!(await el.isVisible({ timeout: 250 }).catch(() => false))) continue;
+                    const val = await readControlValue({ el, meta: { tag: await resolveElementTag(el) } });
+                    if (val) {
+                        result[key] = val;
+                        break;
+                    }
+                } catch (_) { /* next */ }
+            }
+            if (result[key]) continue;
+            for (const pat of placeholderPatterns) {
+                try {
+                    const el = context.getByPlaceholder(pat).first();
+                    if (!(await el.isVisible({ timeout: 250 }).catch(() => false))) continue;
+                    const val = String(await el.inputValue({ timeout: 800 }).catch(() => '')).trim();
+                    if (val) {
+                        result[key] = val;
+                        break;
+                    }
+                } catch (_) { /* next */ }
+            }
         }
-        if (result[key]) continue;
-        for (const pat of placeholderPatterns) {
-            try {
-                const el = page.getByPlaceholder(pat).first();
-                if (!(await el.isVisible({ timeout: 250 }).catch(() => false))) continue;
-                const val = String(await el.inputValue({ timeout: 800 }).catch(() => '')).trim();
-                if (val) {
-                    result[key] = val;
-                    break;
-                }
-            } catch (_) { /* next */ }
+
+        for (const [key, selectors] of Object.entries({
+            name: BILLING_FULL_NAME_SELECTORS,
+            line1: OPENAI_BILLING_FIELD_SELECTORS.line1,
+            city: OPENAI_BILLING_FIELD_SELECTORS.city,
+            postal: OPENAI_BILLING_FIELD_SELECTORS.postal,
+            state: OPENAI_BILLING_FIELD_SELECTORS.state
+        })) {
+            if (result[key]) continue;
+            for (const sel of selectors) {
+                try {
+                    const val = String(await context.locator(sel).first().inputValue({ timeout: 500 }).catch(() => '')).trim();
+                    if (val) {
+                        result[key] = val;
+                        break;
+                    }
+                } catch (_) { /* next */ }
+            }
         }
     }
 
-    for (const [key, selectors] of Object.entries({
-        name: BILLING_FULL_NAME_SELECTORS,
-        line1: OPENAI_BILLING_FIELD_SELECTORS.line1,
-        city: OPENAI_BILLING_FIELD_SELECTORS.city,
-        postal: OPENAI_BILLING_FIELD_SELECTORS.postal
-    })) {
-        if (result[key]) continue;
-        for (const sel of selectors) {
-            try {
-                const val = String(await page.locator(sel).first().inputValue({ timeout: 500 }).catch(() => '')).trim();
-                if (val) {
-                    result[key] = val;
-                    break;
-                }
-            } catch (_) { /* next */ }
-        }
-    }
-
-    if (!result.country) {
-        const currentCountry = await getCurrentBillingCountryValue(page);
-        if (currentCountry.label) result.country = currentCountry.label;
-        else if (currentCountry.value) result.country = currentCountry.value;
+    const currentCountry = await getCurrentBillingCountryValue(page);
+    if (currentCountry.value || currentCountry.label) {
+        result.country = currentCountry.value || currentCountry.label;
     }
 
     return result;
 }
 
-function getBillingFieldStatus(actual, filled = {}) {
-    const countryOk = /united states|^us$/i.test(actual.country || '');
+function getBillingFieldStatus(actual, filled = {}, address = null) {
+    const countryOk = /^(united states(?: of america)?|us|美国)$/i.test(String(actual.country || '').trim());
+    // 提供配置地址时必须读回一致值，不能仅凭字段非空或写入成功判定完成。
+    const matches = (value, expected) => Boolean(expected) && String(value || '').trim().toLowerCase() === String(expected).trim().toLowerCase();
     return {
         name: Boolean(actual.name) || Boolean(filled.name),
-        line1: Boolean(actual.line1) || Boolean(filled.line1),
-        city: Boolean(actual.city) || Boolean(filled.city),
-        postal: Boolean(actual.postal) || Boolean(filled.postal),
-        state: Boolean(actual.state) || Boolean(filled.state),
-        country: countryOk || Boolean(filled.country),
+        line1: address ? matches(actual.line1, address.line1) : Boolean(actual.line1) || Boolean(filled.line1),
+        city: address ? matches(actual.city, address.city) : Boolean(actual.city) || Boolean(filled.city),
+        postal: address ? matches(actual.postal, address.postal_code) : Boolean(actual.postal) || Boolean(filled.postal),
+        state: address ? matches(normalizeStateFullName(actual.state), normalizeStateFullName(address.state)) : Boolean(actual.state) || Boolean(filled.state),
+        country: countryOk,
         actual
     };
 }
@@ -2176,13 +2237,13 @@ async function syncFilledFlags(page, filled) {
     if (actual.city) filled.city = true;
     if (actual.postal) filled.postal = true;
     if (actual.state) filled.state = true;
-    if (/united states|^us$/i.test(actual.country || '')) filled.country = true;
+    filled.country = getBillingFieldStatus(actual).country;
     return filled;
 }
 
-async function isOpenAiBillingFormComplete(page, filled = {}) {
+async function isOpenAiBillingFormComplete(page, filled = {}, address = null) {
     const values = await readBillingInputValues(page);
-    const status = getBillingFieldStatus(values, filled);
+    const status = getBillingFieldStatus(values, filled, address);
     return listBillingMissing(status).length === 0;
 }
 
@@ -2387,8 +2448,9 @@ async function fillBillingLine1InFrame(frame, value) {
 
 async function fillBillingLine1Strict(page, value) {
     if (!value) return false;
-    if (await billingLine1HasValue(page)) {
-        console.log('  [Stripe] ⏭️ Address line 1 已有值，跳过');
+    const current = await readBillingInputValues(page);
+    if (String(current.line1 || '').trim().toLowerCase() === String(value).trim().toLowerCase()) {
+        console.log('  [Stripe] ⏭️ Address line 1 已与配置值一致，跳过');
         return true;
     }
 
